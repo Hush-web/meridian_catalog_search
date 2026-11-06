@@ -1,18 +1,15 @@
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from typing import List, Optional
-import json
 from contextlib import asynccontextmanager
+import time
 
-# Import our search engines
-from rank_bm25 import BM25Okapi
-from qdrant_client import QdrantClient
-from qdrant_client.models import Distance, VectorParams, PointStruct
-from fastembed import TextEmbedding
+# Import the logic we extracted for the evaluation harness
+from search_service import SearchService
 
 # --- GLOBAL STATE ---
-# We load these once when the app starts
-app_state = {}
+# We use app.state to hold our service and cache
+# This avoids global variables and is the FastAPI best practice
 
 # --- PYDANTIC MODELS ---
 class SearchRequest(BaseModel):
@@ -27,127 +24,144 @@ class ProductResult(BaseModel):
     generic_name: str
     price: float
     stock: int
-    warning: Optional[str] = None # For restricted items
+    warning: Optional[str] = None
     is_restricted: bool
 
 class SearchResponse(BaseModel):
     results: List[ProductResult]
 
-# --- STARTUP LOGIC ---
+class AutocompleteResponse(BaseModel):
+    suggestions: List[str]
+
+
+# --- STARTUP LOGIC (LIFESPAN) ---
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # 1. Load Data
-    print("Loading catalog and pharmacies...")
-    with open("catalog.json", "r") as f:
-        app_state["catalog"] = json.load(f)
-    with open("pharmacies.json", "r") as f:
-        app_state["pharmacies"] = json.load(f)
-        
-    # 2. Setup BM25
-    print("Building BM25 Index...")
-    corpus = []
-    for p in app_state["catalog"]:
-        text = f"{p['brand']} {p['generic_name']} {p['active_ingredients']} {p['category']} {p['label_uses']}"
-        corpus.append(text.lower().split())
-    app_state["bm25"] = BM25Okapi(corpus)
+    print("Loading Search Service...")
+    # This loads the catalog, builds BM25, and populates Qdrant
+    app.state.search_service = SearchService()
     
-    # 3. Setup Qdrant & Embeddings
-    print("Building Qdrant Index...")
-    embedding_model = TextEmbedding(model_name="BAAI/bge-small-en-v1.5")
-    client = QdrantClient(":memory:")
-    client.create_collection("products", vectors_config=VectorParams(size=384, distance=Distance.COSINE))
-    
-    texts_to_embed = [f"{p['brand']} {p['generic_name']} {p['label_uses']}" for p in app_state["catalog"]]
-    vectors = list(embedding_model.embed(texts_to_embed))
-    
-    points = [PointStruct(id=i, vector=vectors[i].tolist(), payload=p) for i, p in enumerate(app_state["catalog"])]
-    client.upsert("products", points=points)
-    
-    app_state["embedding_model"] = embedding_model
-    app_state["qdrant"] = client
+    # Initialize the Cache
+    app.state.cache = {}
     
     print("✅ System Ready!")
-    yield # The app is now running and accepting requests
+    yield
     print("Shutting down...")
 
-app = FastAPI(title="Meridian Catalog Search", lifespan=lifespan)
+
+app = FastAPI(
+    title="Meridian Catalog Search", 
+    description="Hybrid Search API for Pharmacy Catalogs",
+    lifespan=lifespan
+)
+
+# --- CACHING HELPER FUNCTIONS ---
+def get_from_cache(key):
+    if key in app.state.cache:
+        result, timestamp = app.state.cache[key]
+        # Cache is valid for 60 seconds (to handle inventory updates)
+        if time.time() - timestamp < 60:
+            return result
+        else:
+            del app.state.cache[key] # Expired
+    return None
+
+def save_to_cache(key, result):
+    app.state.cache[key] = (result, time.time())
+
 
 # --- ENDPOINTS ---
 
 @app.get("/")
 def health_check():
-    return {"status": "healthy"}
+    return {"status": "healthy", "cached_queries": len(app.state.cache)}
 
 @app.post("/search", response_model=SearchResponse)
 def search(request: SearchRequest):
-    # 1. Find the Pharmacy (Tenancy)
-    pharmacy = next((p for p in app_state["pharmacies"] if p["pharmacy_id"] == request.pharmacy_id), None)
-    if not pharmacy:
+    # 1. CHECK CACHE
+    # We build a unique key based on the query and all filters
+    cache_key = f"{request.pharmacy_id}:{request.query}:{request.category}:{request.in_stock_only}"
+    cached_result = get_from_cache(cache_key)
+    
+    if cached_result:
+        print(f"⚡ CACHE HIT for: '{request.query}'")
+        return cached_result
+
+    # 2. RUN HYBRID SEARCH (Using the SearchService)
+    # We fetch 20 results so we have room to apply filters without running out
+    raw_results = app.state.search_service.hybrid_search(
+        query=request.query, 
+        pharmacy_id=request.pharmacy_id, 
+        limit=20
+    )
+
+    # 3. APPLY FILTERS & SAFETY
+    inventory = app.state.search_service.get_inventory(request.pharmacy_id)
+    if inventory is None:
         raise HTTPException(status_code=404, detail="Pharmacy not found")
-        
-    # Create a quick lookup dict for their inventory
-    inventory = {item["product_id"]: item for item in pharmacy["inventory"]}
-    
-    # 2. Run BM25
-    tokenized_query = request.query.lower().split()
-    bm25_top = app_state["bm25"].get_top_n(tokenized_query, app_state["catalog"], n=20)
-    
-    # 3. Run Vector
-    query_vector = list(app_state["embedding_model"].embed([request.query]))[0].tolist()
-    vector_top_raw = app_state["qdrant"].query_points("products", query=query_vector, limit=20).points
-    vector_top = [hit.payload for hit in vector_top_raw]
-    
-    # 4. RRF Fusion
-    rrf_scores = {}
-    k = 60
-    for rank, product in enumerate(bm25_top):
-        pid = product["product_id"]
-        rrf_scores[pid] = rrf_scores.get(pid, 0) + (1 / (k + rank + 1))
-    for rank, product in enumerate(vector_top):
-        pid = product["product_id"]
-        rrf_scores[pid] = rrf_scores.get(pid, 0) + (1 / (k + rank + 1))
-        
-    sorted_pids = sorted(rrf_scores.items(), key=lambda x: x[1], reverse=True)
-    
-    # 5. Build Results (Apply Filters & Safety)
+
     results = []
     seen_brands = set()
     
-    for pid, score in sorted_pids:
-        # TENANCY: Skip if this pharmacy doesn't stock it
+    for p in raw_results:
+        pid = p["product_id"]
+        
+        # TENANCY: Double check they stock it (hybrid_search does this, but safety first)
         if pid not in inventory:
             continue
             
-        product = next(p for p in app_state["catalog"] if p["product_id"] == pid)
         inv_item = inventory[pid]
         
         # FILTERS
-        if request.category and product["category"] != request.category:
+        if request.category and p["category"] != request.category:
             continue
         if request.in_stock_only and inv_item["stock"] <= 0:
             continue
             
         # DEDUPLICATION
-        if product["brand"] in seen_brands:
+        if p["brand"] in seen_brands:
             continue
-        seen_brands.add(product["brand"])
+        seen_brands.add(p["brand"])
         
-        # SAFETY WARNING
+        # SAFETY WARNINGS
         warning = None
-        if product["restricted"]:
+        if p["restricted"]:
             warning = "Age restricted. Requires ID and in-store purchase."
             
         results.append(ProductResult(
             product_id=pid,
-            brand=product["brand"],
-            generic_name=product["generic_name"],
+            brand=p["brand"],
+            generic_name=p["generic_name"],
             price=inv_item["price"],
             stock=inv_item["stock"],
             warning=warning,
-            is_restricted=product["restricted"]
+            is_restricted=p["restricted"]
         ))
         
-        if len(results) >= 5: # Return top 5
+        if len(results) >= 5: # Return top 5 unique brands
             break
+
+    final_response = SearchResponse(results=results)
+    
+    # 4. SAVE TO CACHE
+    save_to_cache(cache_key, final_response)
+    
+    return final_response
+
+
+@app.get("/autocomplete", response_model=AutocompleteResponse)
+def autocomplete(query: str, pharmacy_id: str):
+    inventory = app.state.search_service.get_inventory(pharmacy_id)
+    if inventory is None:
+        raise HTTPException(status_code=404, detail="Pharmacy not found")
+        
+    suggestions = set()
+    # Simple substring match for autocomplete
+    for p in app.state.search_service.catalog:
+        if p["product_id"] not in inventory:
+            continue # Tenancy check
             
-    return SearchResponse(results=results) 
+        if query.lower() in p["brand"].lower() or query.lower() in p["generic_name"].lower():
+            suggestions.add(f"{p['brand']} ({p['generic_name']})")
+            
+    return AutocompleteResponse(suggestions=list(suggestions)[:5])
